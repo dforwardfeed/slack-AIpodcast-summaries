@@ -1,0 +1,10 @@
+arcadepy
+youtube-transcript-api
+openai
+python-dotenv
+weaviate-client
+weaviate-agents
+requests
+python-socks
+PySocks
+stem
