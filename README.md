@@ -1,6 +1,6 @@
 # YouTube Transcript Bot
 
-A Slack integration that monitors channels for YouTube URLs, extracts and summarizes video transcripts using OpenAI, and stores them in a Weaviate vector database for future reference and querying.
+A Slack integration that monitors channels for YouTube URLs, extracts and summarizes video transcripts using OpenAI, and stores them in a Weaviate vector database for future reference and querying. Specifically designed for generative AI podcasts and interviews with founders, operators, and researchers to extract technical insights.
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.8+-blue.svg" alt="Python Version">
