@@ -107,6 +107,7 @@ Example: `!query What are the best practices for React performance?`
 
 If the bot isn't working as expected:
 
+- Ensure you have the latest version of Arcade tools: tool_name="Slack.GetMessagesInChannelByName@[latest version] - Slack.GetChannelMetadataByName@[latest version], Slack.SendDmToUser@[latest version]
 - Ensure all API keys in your `.env` file are correct
 - Verify the YouTube link has an available transcript
 - Check that the channel name matches exactly (case-sensitive)
