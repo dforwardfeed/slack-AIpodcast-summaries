@@ -5,6 +5,8 @@ import traceback
 import requests
 import socks
 import socket
+import signal
+import sys
 from datetime import datetime
 from dotenv import load_dotenv
 from arcadepy import Arcade
@@ -31,7 +33,7 @@ last_proxy_rotation = time.time()
 # User configuration from environment variables
 USER_ID = os.environ.get("USER_ID", "")
 CHANNEL_NAME = os.environ.get("CHANNEL_NAME", "")
-TARGET_USERNAME = os.environ.get("TARGET_USERNAME", "")
+CHANNEL_NAME2 = os.environ.get("CHANNEL_NAME2", "")  # Output channel for responses
 
 def setup_proxy():
     """Configure proxy based on environment settings"""
@@ -161,6 +163,30 @@ if os.environ.get("WEAVIATE_URL") and os.environ.get("WEAVIATE_API_KEY"):
 else:
     print("Weaviate credentials not provided. Summaries will not be stored for searching.")
 
+# Define a function to clean up resources
+def cleanup_resources():
+    """Clean up resources before exiting."""
+    if weaviate_enabled and weaviate_client:
+        try:
+            print("Closing Weaviate client connection...")
+            weaviate_client.close()
+            print("Weaviate client connection closed successfully")
+        except Exception as e:
+            print(f"Error closing Weaviate client: {e}")
+            traceback.print_exc()
+
+# Set up signal handlers for graceful shutdown
+def signal_handler(sig, frame):
+    """Handle termination signals."""
+    print("\nReceived termination signal. Cleaning up resources...")
+    cleanup_resources()
+    print("Cleanup complete. Exiting.")
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
+
 # Define YouTube URL pattern - updated to handle Slack's URL formatting
 YOUTUBE_URL_PATTERN = r'<?(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})(&amp;[^>]*)?'
 
@@ -227,6 +253,22 @@ def store_summary_in_weaviate(video_id, video_url, summary):
         print("Failed to store summary in Weaviate")
         return False
 
+def clean_query_formatting(text):
+    """
+    Clean up formatting issues in query responses.
+    This removes all asterisks to prevent formatting issues in Slack.
+    """
+    # Replace all instances of bold formatting (text between pairs of asterisks)
+    cleaned_text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)  # Replace **bold** with just text
+    cleaned_text = re.sub(r'\*([^*]+)\*', r'\1', cleaned_text)  # Replace *bold* with just text
+    
+    # Ensure "Sources:" is not formatted
+    if "Sources:" in cleaned_text or "*Sources:*" in cleaned_text:
+        # Replace any remaining "*Sources:*" with plain "Sources:"
+        cleaned_text = cleaned_text.replace("*Sources:*", "Sources:")
+    
+    return cleaned_text
+
 def query_summaries(query_text):
     """Query the stored summaries using Weaviate's Query Agent with enhanced citations.
     
@@ -269,7 +311,7 @@ def query_summaries(query_text):
         
         # Add sources/citations if they exist
         if hasattr(response, 'sources') and response.sources:
-            final_answer += "\n\n*Sources:*"
+            final_answer += "\n\nSources:"  # No asterisks for plain text formatting
             for i, source in enumerate(response.sources, 1):
                 # Get the object_id from the source
                 if hasattr(source, 'object_id'):
@@ -328,6 +370,9 @@ def query_summaries(query_text):
                         final_answer += f"\n{i}. Source ID: {object_id}"
                 else:
                     final_answer += f"\n{i}. Unknown source"
+        
+        # Clean up the final answer to prevent formatting issues
+        final_answer = clean_query_formatting(final_answer)
         
         return final_answer
     except ImportError:
@@ -443,16 +488,19 @@ Also mention any insights, metrics, or statistics shared about AI. Remember that
         print(f"Error summarizing transcript: {e}")
         return f"Error generating summary: {str(e)}"
 
-def send_dm_to_user(user_id, username, message):
-    """Send a direct message to a user."""
+def send_message_to_channel(user_id, channel_name, message):
+    """Send a message to a Slack channel."""
     try:
-        print(f"Attempting to send DM to {username}...")
+        print(f"Sending message to #{channel_name}: {message[:50]}...")
         
-        # Use the Arcade tools interface to send a DM
+        # Use the Arcade tools interface to send a message to the channel
         response = client.tools.execute(
-            tool_name="Slack.SendDmToUser@0.4.0",
+            tool_name="Slack.SendMessageToChannel",
             input={
-                "user_name": username,  # Changed from 'username' to 'user_name'
+                "owner": "ArcadeAI",
+                "name": "arcade-ai",
+                "starred": "true",
+                "channel_name": channel_name,
                 "message": message
             },
             user_id=user_id,
@@ -460,18 +508,18 @@ def send_dm_to_user(user_id, username, message):
         
         # Check if the response was successful
         if response and response.output and response.output.value:
-            print(f"Successfully sent DM to {username}")
+            print(f"Successfully sent message to channel #{channel_name}")
             return True
         else:
             print(f"Error sending message: Response did not contain expected data")
             return False
             
     except Exception as e:
-        print(f"Error sending DM: {e}")
+        print(f"Error sending message to channel: {e}")
         traceback.print_exc()
         return False
 
-def handle_query_command(user_id, channel_name, message_text, target_username=TARGET_USERNAME):
+def handle_query_command(user_id, channel_name, message_text):
     """Handle a query command from Slack (!query)."""
     try:
         # Remove any Slack formatting (code blocks, bullets, etc.)
@@ -487,16 +535,19 @@ def handle_query_command(user_id, channel_name, message_text, target_username=TA
                 # Query the summaries
                 result = query_summaries(query)
                 
-                print(f"Query result obtained. Sending to {target_username}...")
+                # Clean up all formatting issues in the result
+                result = clean_query_formatting(result)
                 
-                # Send the result as a DM
-                message = f"*Query Results:*\n\n{result}"
-                success = send_dm_to_user(user_id, target_username, message)
+                print(f"Query result obtained. Sending to channel #{CHANNEL_NAME2}...")
+                
+                # Send the result to the output channel
+                message = f"Query Results:\n\n{result}"
+                success = send_message_to_channel(user_id, CHANNEL_NAME2, message)
                 
                 if success:
-                    print(f"Query results successfully sent to {target_username}")
+                    print(f"Query results successfully sent to channel #{CHANNEL_NAME2}")
                 else:
-                    print(f"Failed to send query results to {target_username}")
+                    print(f"Failed to send query results to channel #{CHANNEL_NAME2}")
                 
                 return True
             else:
@@ -507,7 +558,7 @@ def handle_query_command(user_id, channel_name, message_text, target_username=TA
         traceback.print_exc()
         return False
 
-def process_youtube_url(user_id, channel_name, message_text, original_url=None, target_username=TARGET_USERNAME):
+def process_youtube_url(user_id, channel_name, message_text, original_url=None):
     """Process a message with a YouTube URL."""
     try:
         print("\n==================================================")
@@ -532,7 +583,7 @@ def process_youtube_url(user_id, channel_name, message_text, original_url=None, 
         video_id = extract_video_id(url)
         if not video_id:
             print("Could not extract video ID from URL")
-            send_dm_to_user(user_id, target_username, f"Could not extract video ID from the URL: {url}")
+            send_message_to_channel(user_id, CHANNEL_NAME2, f"Could not extract video ID from the URL: {url}")
             return
             
         print(f"Processing YouTube video ID: {video_id}")
@@ -556,7 +607,7 @@ def process_youtube_url(user_id, channel_name, message_text, original_url=None, 
         if not transcript:
             error_message = f"Could not retrieve transcript for the YouTube video: {url}\n\nThis is likely because the video doesn't have subtitles/captions enabled, or they're in a language not supported by the API. Please try a different video with captions enabled."
             print(f"Failed to retrieve transcript. Error: {transcript_error}")
-            send_dm_to_user(user_id, target_username, error_message)
+            send_message_to_channel(user_id, CHANNEL_NAME2, error_message)
             return
         
         print(f"Successfully retrieved transcript with {len(transcript)} characters")
@@ -577,22 +628,22 @@ def process_youtube_url(user_id, channel_name, message_text, original_url=None, 
             if summary_error:
                 error_message += f"\n\nError: {summary_error}"
             print("Failed to summarize transcript")
-            send_dm_to_user(user_id, target_username, error_message)
+            send_message_to_channel(user_id, CHANNEL_NAME2, error_message)
             return
             
         print(f"Successfully generated summary with {len(summary)} characters")
         
         # Now that we have both transcript and summary, proceed with sending to Slack and storing in Weaviate
         
-        # 1. Send the summary to Slack
+        # 1. Send the summary to the output channel
         message = f"*Summary of YouTube Video:*\n\n{summary}\n\n*Original URL:* {url}"
-        print("Sending summary to Slack...")
-        slack_result = send_dm_to_user(user_id, target_username, message)
+        print(f"Sending summary to channel #{CHANNEL_NAME2}...")
+        slack_result = send_message_to_channel(user_id, CHANNEL_NAME2, message)
         
         if slack_result:
-            print("Successfully sent summary to Slack")
+            print(f"Successfully sent summary to channel #{CHANNEL_NAME2}")
         else:
-            print("Failed to send summary to Slack")
+            print(f"Failed to send summary to channel #{CHANNEL_NAME2}")
         
         # 2. Store the summary in Weaviate
         weaviate_result = False
@@ -625,7 +676,7 @@ def process_youtube_url(user_id, channel_name, message_text, original_url=None, 
         print(f"Error processing YouTube URL: {e}")
         traceback.print_exc()
         try:
-            send_dm_to_user(user_id, target_username, f"An error occurred while processing the YouTube video: {str(e)}")
+            send_message_to_channel(user_id, CHANNEL_NAME2, f"An error occurred while processing the YouTube video: {str(e)}")
         except:
             print("Failed to send error message to Slack")
         return {
@@ -633,10 +684,78 @@ def process_youtube_url(user_id, channel_name, message_text, original_url=None, 
             "error": str(e)
         }
 
-def listen_to_slack_messages(user_id, channel_name, target_username=TARGET_USERNAME):
+def handle_slack_authorization(user_id, tool_name):
+    """
+    Handle Slack authorization for a specific tool.
+    
+    Args:
+        user_id (str): The user ID to authorize
+        tool_name (str): The name of the Slack tool to authorize
+        
+    Returns:
+        bool: True if authorization was successful, False otherwise
+    """
+    print(f"Authorizing Slack access for {tool_name}...")
+    
+    try:
+        # Start the authorization process
+        auth_response = client.tools.authorize(
+            tool_name=tool_name,
+            user_id=user_id,
+        )
+        
+        # Check if authorization is already complete
+        if hasattr(auth_response, 'status') and auth_response.status == "completed":
+            print(f"Authorization for {tool_name} already completed.")
+            return True
+            
+        # If authorization is not complete, provide URL for user to complete it
+        if hasattr(auth_response, 'url') and auth_response.url:
+            print(f"\n===== AUTHORIZATION REQUIRED =====")
+            print(f"Please complete the authorization for {tool_name} by visiting:")
+            print(f"{auth_response.url}")
+            print(f"===================================\n")
+            
+            # Wait for authorization to complete
+            print(f"Waiting for authorization to complete... (Press Ctrl+C to cancel)")
+            
+            # Poll for authorization completion
+            max_attempts = 30  # Maximum number of attempts (5 minutes with 10-second intervals)
+            for attempt in range(max_attempts):
+                try:
+                    # Check authorization status
+                    status_response = client.tools.get_authorization_status(
+                        tool_name=tool_name,
+                        user_id=user_id,
+                    )
+                    
+                    if hasattr(status_response, 'status') and status_response.status == "completed":
+                        print(f"Authorization for {tool_name} completed successfully!")
+                        return True
+                        
+                    print(f"Authorization pending... (Attempt {attempt+1}/{max_attempts})")
+                    time.sleep(10)  # Wait 10 seconds between checks
+                    
+                except Exception as e:
+                    print(f"Error checking authorization status: {e}")
+                    time.sleep(10)  # Wait before retrying
+            
+            print(f"Authorization for {tool_name} timed out after {max_attempts} attempts.")
+            return False
+            
+        else:
+            print(f"No authorization URL provided for {tool_name}. Cannot complete authorization.")
+            return False
+            
+    except Exception as e:
+        print(f"Error during authorization for {tool_name}: {e}")
+        traceback.print_exc()
+        return False
+
+def listen_to_slack_messages(user_id, channel_name):
     """Listen to Slack messages in a specific channel and process YouTube URLs."""
     print(f"Starting to monitor Slack channel #{channel_name} for YouTube URLs")
-    print(f"Summaries will be sent as DMs to {target_username}")
+    print(f"Summaries will be sent to channel #{CHANNEL_NAME2}")
     
     # Setup Weaviate collection
     try:
@@ -646,46 +765,66 @@ def listen_to_slack_messages(user_id, channel_name, target_username=TARGET_USERN
         traceback.print_exc()
         print("Continuing without Weaviate integration...")
     
-    # Get authorization for Slack
-    # First authorize for channel metadata
-    print("Authorizing Slack access for GetChannelMetadataByName...")
-    auth_response = client.tools.authorize(
-        tool_name="Slack.GetChannelMetadataByName@0.4.0",
-        user_id=user_id,
-    )
+    # Authorize all required Slack tools
+    slack_tools = [
+        "Slack.GetChannelMetadataByName",
+        "Slack.GetMessagesInChannelByName",
+        "Slack.SendMessageToChannel"
+    ]
     
-    # Then authorize for messages
-    print("Authorizing Slack access for GetMessagesInChannelByName...")
-    auth_response = client.tools.authorize(
-        tool_name="Slack.GetMessagesInChannelByName@0.4.0",
-        user_id=user_id,
-    )
+    for tool in slack_tools:
+        if not handle_slack_authorization(user_id, tool):
+            print(f"Failed to authorize {tool}. Cannot continue.")
+            return
     
-    # Authorize for sending DMs
-    print("Authorizing Slack access for SendDmToUser...")
-    auth_response = client.tools.authorize(
-        tool_name="Slack.SendDmToUser@0.4.0",
-        user_id=user_id,
-    )
+    # Get channel metadata for the input channel
+    try:
+        channel_response = client.tools.execute(
+            tool_name="Slack.GetChannelMetadataByName",
+            input={
+                "owner": "ArcadeAI",
+                "name": "arcade-ai",
+                "starred": "true",
+                "channel_name": channel_name,
+            },
+            user_id=user_id,
+        )
+        
+        channel_id = channel_response.output.value.get("id")
+        print(f"Found input channel #{channel_name} with ID {channel_id}")
+    except Exception as e:
+        print(f"Error getting channel metadata for #{channel_name}: {e}")
+        traceback.print_exc()
+        print("Cannot continue without channel access.")
+        return
     
-    # Get channel metadata
-    channel_response = client.tools.execute(
-        tool_name="Slack.GetChannelMetadataByName@0.4.0",
-        input={
-            "channel_name": channel_name,
-        },
-        user_id=user_id,
-    )
-    
-    channel_id = channel_response.output.value.get("id")
-    print(f"Found channel #{channel_name} with ID {channel_id}")
+    # Get channel metadata for the output channel
+    try:
+        output_channel_response = client.tools.execute(
+            tool_name="Slack.GetChannelMetadataByName",
+            input={
+                "owner": "ArcadeAI",
+                "name": "arcade-ai",
+                "starred": "true",
+                "channel_name": CHANNEL_NAME2,
+            },
+            user_id=user_id,
+        )
+        
+        output_channel_id = output_channel_response.output.value.get("id")
+        print(f"Found output channel #{CHANNEL_NAME2} with ID {output_channel_id}")
+    except Exception as e:
+        print(f"Error getting channel metadata for #{CHANNEL_NAME2}: {e}")
+        traceback.print_exc()
+        print("Cannot continue without output channel access.")
+        return
     
     print(f"Starting to monitor channel #{channel_name} for YouTube URLs")
     print("Waiting for messages... (Press Ctrl+C to stop)")
     
-    # Send a test DM to the target user
-    message = "YouTube Transcript Bot is now running and monitoring the #youtube channel for URLs and query commands."
-    send_dm_to_user(user_id, target_username, message)
+    # Send a test message to the output channel
+    message = f"YouTube Transcript Bot is now running and monitoring #{channel_name} for URLs and query commands. Results will be posted in this channel."
+    send_message_to_channel(user_id, CHANNEL_NAME2, message)
     
     # Keep track of processed messages to avoid duplicates
     processed_messages = set()
@@ -704,8 +843,11 @@ def listen_to_slack_messages(user_id, channel_name, target_username=TARGET_USERN
             print("Checking for new messages...")
             # Get recent messages in the channel using oldest_relative to ensure we get new messages
             messages_response = client.tools.execute(
-                tool_name="Slack.GetMessagesInChannelByName@0.4.0",
+                tool_name="Slack.GetMessagesInChannelByName",
                 input={
+                    "owner": "ArcadeAI",
+                    "name": "arcade-ai",
+                    "starred": "true", 
                     "channel_name": channel_name,
                     "limit": 10,
                     "oldest_relative": "0:0:5"  # Last 5 minutes
@@ -852,7 +994,7 @@ def main():
     # Load configuration from environment variables
     user_id = USER_ID
     channel_name = CHANNEL_NAME
-    target_username = TARGET_USERNAME
+    output_channel = CHANNEL_NAME2
     
     # Validate required environment variables
     missing_vars = []
@@ -860,8 +1002,8 @@ def main():
         missing_vars.append("USER_ID")
     if not channel_name:
         missing_vars.append("CHANNEL_NAME")
-    if not target_username:
-        missing_vars.append("TARGET_USERNAME")
+    if not output_channel:
+        missing_vars.append("CHANNEL_NAME2")
     
     if missing_vars:
         print("Error: The following required environment variables are missing:")
@@ -873,7 +1015,7 @@ def main():
     print("YouTube Transcript Summarizer for Slack")
     print("---------------------------------------")
     print(f"Will monitor the #{channel_name} channel for YouTube URLs")
-    print(f"and send summaries as DMs to {target_username}")
+    print(f"and send summaries to #{output_channel}")
     print("")
     
     # Test YouTube connectivity
@@ -881,8 +1023,17 @@ def main():
     
     print("Checking authorization status and channel access...")
     
-    # Start listening for messages
-    listen_to_slack_messages(user_id, channel_name, target_username)
+    try:
+        # Start listening for messages
+        listen_to_slack_messages(user_id, channel_name)
+    except KeyboardInterrupt:
+        print("\nApplication interrupted by user.")
+    except Exception as e:
+        print(f"Error in main application: {e}")
+        traceback.print_exc()
+    finally:
+        # Ensure resources are cleaned up
+        cleanup_resources()
 
 if __name__ == "__main__":
     main()
